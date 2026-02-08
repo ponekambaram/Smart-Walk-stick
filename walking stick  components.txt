@@ -1,0 +1,18 @@
+1] ESP32 DevKit V1
+2] ESP32-CAM Module
+3] FTDI Programmer (USB-to-Serial)
+4] Ultrasonic Sensor
+5] Buzzer
+6] Vibration Motor (if necessary)
+7] GPS Module (NEO-6M)
+8] GSM Module (SIM800L or SIM900A)
+9] SOS Push Button
+10] MAX30102 / MAX30100 Sensor
+11] DHT22
+12] MPU6050 Sensor
+13] DFPlayer Mini
+14] Mini Speaker (8Ω, 1W)
+15] Li-ion Battery
+16] Boost Converter
+17] Solar Panel (5V/1W)(optional)
+18] Switch

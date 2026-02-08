@@ -1,0 +1,259 @@
+/******************************************************
+  SMART WALKING STICK – ESP32 MAIN (FINAL ML VERSION)
+  Final integration of:
+  - ML terrain detection (via ESP32-CAM UART)
+  - DFPlayer audio feedback
+  - MAX30102 heart rate
+  - MPU6050 fall detection
+  - GPS location
+  - GSM SMS alert
+  - Ultrasonic obstacle detection
+******************************************************/
+
+#include <HardwareSerial.h>
+#include <Wire.h>
+#include <SoftwareSerial.h>
+
+#include "DFRobotDFPlayerMini.h"
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <MPU6050_tockn.h>
+#include <TinyGPS++.h>
+
+// ---------- HARDWARE UARTS ----------
+HardwareSerial camSerial(1);    // ESP32-CAM ML (16=RX, 17=TX)
+HardwareSerial dfSerial(2);     // DFPlayer (26=RX, 27=TX)
+
+// ---------- SOFTWARE UARTS ----------
+SoftwareSerial gpsSerial(15, 4);     // GPS: RX=15, TX=4
+SoftwareSerial gsmSerial(32, 33);    // GSM: RX=32, TX=33
+
+// ---------- MODULES ----------
+DFRobotDFPlayerMini dfplayer;
+MAX30105 max30102;
+MPU6050 mpu(Wire);
+TinyGPSPlus gps;
+
+// ---------- Ultrasonic ----------
+#define TRIG_PIN 12
+#define ECHO_PIN 14
+
+// ---------- STATES ----------
+String lastML = "";
+unsigned long lastBeat = 0;
+unsigned long lastHRAnnounce = 0;
+int heartRateValue = 0;
+
+// ---------- FUNCTIONS ----------
+
+void playAudio(int track) {
+  Serial.print("Playing audio track: ");
+  Serial.println(track);
+  dfplayer.playFolder(1, track);
+  delay(250);
+}
+
+bool detectFall() {
+  mpu.update();
+  float acc = abs(mpu.getAccX()) + abs(mpu.getAccY()) + abs(mpu.getAccZ());
+  return (acc > 2.0);   // threshold
+}
+
+long getDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (duration == 0) return -1;
+
+  return duration * 0.034 / 2.0;
+}
+
+void sendSMS(String msg, double lat, double lon) {
+  gsmSerial.println("AT+CMGF=1");  
+  delay(300);
+  gsmSerial.println("AT+CMGS=\"+91XXXXXXXXXX\"");  // your number here
+  delay(300);
+
+  gsmSerial.print(msg);
+  gsmSerial.print("\nLocation: https://maps.google.com/?q=");
+  gsmSerial.print(lat, 6);
+  gsmSerial.print(",");
+  gsmSerial.print(lon, 6);
+
+  delay(300);
+  gsmSerial.write(26); // CTRL+Z
+  delay(2000);
+}
+
+
+// =================================================
+//                     SETUP
+// =================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println("SMART WALKING STICK – MAIN ESP32");
+
+  camSerial.begin(115200, SERIAL_8N1, 16, 17);
+  dfSerial.begin(9600, SERIAL_8N1, 26, 27);
+  gpsSerial.begin(9600);
+  gsmSerial.begin(9600);
+
+  Serial.println("Checking DFPlayer...");
+  if (!dfplayer.begin(dfSerial)) {
+    Serial.println("❌ DFPlayer NOT detected");
+  } else {
+    dfplayer.volume(25);
+    Serial.println("✔ DFPlayer OK");
+  }
+
+  Wire.begin(21, 22);
+
+  Serial.println("Initializing MPU6050...");
+  mpu.begin();
+  mpu.calcGyroOffsets(true);
+  Serial.println("✔ MPU6050 OK");
+
+  Serial.println("Initializing MAX30102...");
+  if (!max30102.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("❌ MAX30102 NOT detected");
+  } else {
+    max30102.setup(60, 4, 2, 100, 411, 4096);
+    Serial.println("✔ MAX30102 OK");
+  }
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  Serial.println("SYSTEM READY");
+}
+
+
+// =================================================
+//                     LOOP
+// =================================================
+void loop() {
+
+  /******************************************************
+   * 1. FIXED ML PARSER — WORKS WITH YOUR CAM OUTPUT
+   * Matches:  🎯DETECTED:pit(100.0%)
+   *           🎯DETECTED:road(100.0%)
+   *           🎯DETECTED:stairs(100.0%)
+   ******************************************************/
+  
+  if (camSerial.available()) {
+    String ml = camSerial.readStringUntil('\n');
+
+    ml.trim();
+    ml.replace("\r", "");
+    ml.replace("\n", "");
+    ml.replace(" ", "");
+
+    Serial.print("RAW ML STRING = [");
+    Serial.print(ml);
+    Serial.println("]");
+
+    // Ignore noise like "0", "1", "99"
+    if (ml.length() <= 2) {
+      Serial.println("Ignored noise.");
+      return;
+    }
+
+    String result = "";
+
+    if (ml.indexOf("pit") != -1)          result = "pit";
+    else if (ml.indexOf("road") != -1)    result = "road";
+    else if (ml.indexOf("stairs") != -1)  result = "stairs";
+    else {
+      Serial.println("ML ignored (not pit/road/stairs)");
+      return;
+    }
+
+    if (result == lastML) return;
+    lastML = result;
+
+    Serial.print("FINAL ML = ");
+    Serial.println(result);
+
+    if (result == "pit") playAudio(1);
+    else if (result == "road") playAudio(2);
+    else if (result == "stairs") playAudio(3);
+  }
+
+
+  /******************************************************
+   * 2. Obstacle Detection
+   ******************************************************/
+  long dist = getDistanceCM();
+  if (dist > 0 && dist < 40) {
+    static unsigned long lastObs = 0;
+
+    if (millis() - lastObs > 2000) {
+      Serial.println("Obstacle Detected!");
+      playAudio(4);
+      lastObs = millis();
+    }
+  }
+
+
+  /******************************************************
+   * 3. Heart Rate Detection
+   ******************************************************/
+  long ir = max30102.getIR();
+
+  if (ir > 20000) {
+    if (checkForBeat(ir)) {
+
+      long delta = millis() - lastBeat;
+      lastBeat = millis();
+      heartRateValue = 60 / (delta / 1000.0);
+
+      Serial.print("BPM: ");
+      Serial.println(heartRateValue);
+
+      if (millis() - lastHRAnnounce > 4000) {
+        lastHRAnnounce = millis();
+
+        if (heartRateValue < 60) playAudio(5);
+        else if (heartRateValue <= 100) playAudio(6);
+        else playAudio(7);
+      }
+    }
+  }
+
+
+  /******************************************************
+   * 4. Fall Detection + SMS
+   ******************************************************/
+  if (detectFall()) {
+    Serial.println("FALL DETECTED!");
+    playAudio(8);
+
+    double lat = gps.location.lat();
+    double lon = gps.location.lng();
+
+    sendSMS("Fall detected!", lat, lon);
+    delay(3000);
+  }
+
+
+  /******************************************************
+   * 5. GPS Feed
+   ******************************************************/
+  while (gpsSerial.available())
+    gps.encode(gpsSerial.read());
+
+
+  /******************************************************
+   * 6. GSM Debug (optional)
+   ******************************************************/
+  if (gsmSerial.available()) {
+    Serial.print("GSM: ");
+    Serial.println(gsmSerial.readStringUntil('\n'));
+  }
+
+  delay(20);
+}
